@@ -195,6 +195,15 @@
 				When streaming terrain, this can be used to determine if an area has fully "loaded", in case the game relies meshes or mesh colliders.
 			</description>
 		</method>
+		<method name="remesh_area">
+			<return type="void" />
+			<param index="0" name="area_in_voxels" type="AABB" />
+			<description>
+				Tells the terrain that the generator now produces different results in this area, without modifying any voxel.
+				Meshes covering the area are scheduled for an update at every LOD, and cached generated blocks are dropped so the generator gets asked again. Blocks that were actually edited are left alone.
+				Use this when a parameter of the generator changes at runtime. Editing voxels is otherwise the only thing that schedules a remesh, and faking an edit would mark blocks as modified, keeping them in memory and saving them to the stream as if they had been edited by the game.
+			</description>
+		</method>
 		<method name="save_modified_blocks">
 			<return type="VoxelSaveCompletionTracker" />
 			<description>

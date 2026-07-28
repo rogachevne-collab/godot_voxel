@@ -364,6 +364,7 @@ private:
 	int /*Error*/ _b_debug_dump_as_scene(String fpath, bool include_instancer) const;
 
 	bool _b_is_area_meshed(AABB aabb, int lod_index) const;
+	void _b_remesh_area(AABB aabb);
 
 	Dictionary _b_get_statistics() const;
 

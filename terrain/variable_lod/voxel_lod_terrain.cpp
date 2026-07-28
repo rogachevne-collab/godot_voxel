@@ -3840,6 +3840,20 @@ bool VoxelLodTerrain::_b_is_area_meshed(AABB aabb, int lod_index) const {
 	return is_area_meshed(Box3i(aabb.position, aabb.size), lod_index);
 }
 
+// Tell the terrain that the generator now answers differently in this area, without touching a single voxel.
+//
+// Editing is otherwise the ONLY thing that schedules a remesh, so a generator whose parameters change at runtime has no
+// way to become visible. Faking it by pasting every covered block works, and lies in the data: pasted blocks are marked
+// edited and modified, which keeps them resident forever, writes their mips, and — with a stream attached — saves the
+// position of a view parameter into the world file as if it were dug ground.
+//
+// The honest path already exists for C++ modifiers (`post_edit_modifiers`), it just was not reachable from a script.
+// It drops cached generated blocks (edited and modified ones are skipped, so real edits survive) and schedules a mesh
+// update at every LOD, so the generator gets asked again.
+void VoxelLodTerrain::_b_remesh_area(AABB aabb) {
+	post_edit_modifiers(Box3i(aabb.position, aabb.size));
+}
+
 void VoxelLodTerrain::_bind_methods() {
 	using Self = VoxelLodTerrain;
 
@@ -3906,6 +3920,7 @@ void VoxelLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_stream_running_in_editor"), &Self::is_stream_running_in_editor);
 
 	ClassDB::bind_method(D_METHOD("is_area_meshed", "area_in_voxels", "lod_index"), &Self::_b_is_area_meshed);
+	ClassDB::bind_method(D_METHOD("remesh_area", "area_in_voxels"), &Self::_b_remesh_area);
 
 	// Normalmaps
 
