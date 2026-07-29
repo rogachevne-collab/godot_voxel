@@ -2004,9 +2004,16 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		if (block != nullptr) {
 			// No surface anymore in this block, destroy it.
 			// This has to go through the same door as streaming unload: the block may be fading right now, and
-			// leaving it in `_fading_blocks_per_lod` after it is freed is a use-after-free the next frame. Fading
-			// out is asked for, so ground that an edit has eaten dissolves instead of blinking away.
-			remove_mesh_block(ob.lod, ob.position, true, get_global_transform(), get_local_camera_info());
+			// leaving it in `_fading_blocks_per_lod` after it is freed is a use-after-free the next frame.
+			//
+			// But NO fade-out, and the difference from streaming unload is the whole reason for the flag. There,
+			// the surface survives the block — another LOD is standing up in the same place, and the dissolve
+			// crossfades two copies of the SAME wall. Here the surface is GONE: an edit emptied the block, and
+			// whatever emptied it (in the host game, a room of air carved around a moving camera) put the new
+			// surface metres away. A quarter-second dissolve of the old wall then hangs in mid-air as a
+			// translucent plane with nothing behind it — reported from the chair as "planes floating for a
+			// moment while strafing" — which reads as a bug, not a transition.
+			remove_mesh_block(ob.lod, ob.position, false, get_global_transform(), get_local_camera_info());
 		}
 		// ZN_PRINT_VERBOSE(format("Empty block pos {} lod {} time {}", ob.position, int(ob.lod),
 		// 		Time::get_singleton()->get_ticks_msec()));
