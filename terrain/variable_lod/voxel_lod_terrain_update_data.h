@@ -7,6 +7,7 @@
 #include "../../util/containers/fixed_array.h"
 #include "../../util/containers/std_map.h"
 #include "../../util/containers/std_unordered_map.h"
+#include "../../util/containers/std_unordered_set.h"
 #include "../../util/containers/std_vector.h"
 #include "../../util/safe_ref_count.h"
 #include "../../util/tasks/cancellation_token.h"
@@ -338,6 +339,29 @@ struct VoxelLodTerrainUpdateData {
 		// Areas where generated stuff has changed. Similar to an edit, but non-destructive.
 		StdVector<Box3i> changed_generated_areas;
 		BinaryMutex changed_generated_areas_mutex;
+
+		// One flush of `changed_generated_areas` schedules many mesh updates, and without further care their
+		// results land over several frames: the thread pool finishes them in any order, and the main-thread
+		// spread runner then trickles even the finished ones. A surface that one call moved — the host game
+		// carves a room of air around a flying camera — therefore reappears block by block, as a visible
+		// staircase crawling across the wall. So the blocks scheduled by one flush are remembered here as a
+		// BATCH: the terrain holds their arriving meshes back and applies the whole set in a single frame once
+		// the last one lands, or a timeout gives up on it (see `try_hold_batched_mesh_update`).
+		//
+		// Only `changed_generated_areas` flushes create batches. Ordinary edits keep the trickle: they arrive
+		// one block at a time anyway, and holding them would only add latency to the cutter.
+		struct RemeshBatch {
+			// Blocks scheduled and not yet arrived, per LOD. Keys are erased as results arrive.
+			FixedArray<StdUnorderedSet<Vector3i>, constants::MAX_LOD> pending_by_lod;
+			unsigned int remaining = 0;
+			uint32_t id = 0;
+			// Stamped lazily by the terrain on the main thread (first `_process` that sees the batch), so this
+			// header needs no clock and the update thread no time source. Zero means "not stamped yet".
+			uint64_t first_seen_ms = 0;
+		};
+		StdVector<RemeshBatch> remesh_batches;
+		uint32_t next_remesh_batch_id = 1;
+		BinaryMutex remesh_batches_mutex;
 
 		Stats stats;
 	};

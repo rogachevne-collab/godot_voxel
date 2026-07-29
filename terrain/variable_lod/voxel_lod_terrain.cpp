@@ -147,6 +147,11 @@ VoxelLodTerrain::VoxelLodTerrain() {
 	callbacks.data = this;
 	callbacks.mesh_output_callback = [](void *cb_data, VoxelEngine::BlockMeshOutput &ob) {
 		VoxelLodTerrain *self = reinterpret_cast<VoxelLodTerrain *>(cb_data);
+		// Members of a remesh batch don't take the spread runner at all — the whole point of a batch is that
+		// its blocks reach the screen on the same frame. See `RemeshBatch`.
+		if (self->try_hold_batched_mesh_update(ob)) {
+			return;
+		}
 		ApplyMeshUpdateTask *task = ZN_NEW(ApplyMeshUpdateTask);
 		task->volume_id = self->get_volume_id();
 		task->self = self;
@@ -1322,6 +1327,9 @@ void VoxelLodTerrain::process(float delta) {
 
 	// Do it after we change mesh block states so materials are updated
 	process_fading_blocks(delta);
+
+	// Time out remesh batches whose last member is never coming — see `RemeshBatch`.
+	process_remesh_batches();
 }
 
 // Destroys a mesh block, and everything that points at it.
@@ -1868,6 +1876,118 @@ inline void set_block_collision_shape(
 	block.set_collision_mask(terrain.get_collision_mask());
 	block.last_collider_update_time = now;
 	block.deferred_collider_data.reset();
+}
+
+// Main thread (the mesh output callback runs from `VoxelEngine::process`). Parks the output if it belongs to
+// a remesh batch, and applies the whole batch the moment its last member lands. Returns false for everything
+// that is not batch business, which is the overwhelmingly common case and costs one mutex and an empty check.
+bool VoxelLodTerrain::try_hold_batched_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
+	if (ob.lod >= constants::MAX_LOD) {
+		return false;
+	}
+	uint32_t held_id = 0;
+	uint32_t completed_batch_id = 0;
+	{
+		VoxelLodTerrainUpdateData::State &state = _update_data->state;
+		MutexLock lock(state.remesh_batches_mutex);
+		if (state.remesh_batches.size() == 0) {
+			return false;
+		}
+		for (size_t i = 0; i < state.remesh_batches.size(); ++i) {
+			VoxelLodTerrainUpdateData::State::RemeshBatch &batch = state.remesh_batches[i];
+			StdUnorderedSet<Vector3i> &pending = batch.pending_by_lod[ob.lod];
+			auto it = pending.find(ob.position);
+			if (it == pending.end()) {
+				continue;
+			}
+			// A key is erased on arrival, so a SECOND output for the same block — a cutter edit racing the
+			// batch — is not captured and keeps its ordinary immediate path.
+			pending.erase(it);
+			held_id = batch.id;
+			ZN_ASSERT(batch.remaining > 0);
+			--batch.remaining;
+			if (batch.remaining == 0) {
+				completed_batch_id = batch.id;
+				state.remesh_batches.erase(state.remesh_batches.begin() + i);
+			}
+			break;
+		}
+	}
+	if (held_id == 0) {
+		return false;
+	}
+	_held_batched_mesh_updates.push_back(HeldBatchedMeshUpdate{ held_id, std::move(ob) });
+	if (completed_batch_id != 0) {
+		flush_remesh_batch(completed_batch_id);
+	}
+	return true;
+}
+
+// Apply every held output of one batch, in one frame. Two staleness guards, both against the same race: a
+// block can be re-scheduled by an ordinary edit while its batched output sits here, and the newer result may
+// overtake through the immediate path. If a newer task is still queued on the spread runner, or the block has
+// already been brought `MESH_UP_TO_DATE` by someone else (our own deferred apply cannot have done it — the
+// SENT -> UP_TO_DATE exchange happens in `apply_mesh_update`, which we postponed), the held mesh is the older
+// of the two and applying it would put stale ground over fresh.
+void VoxelLodTerrain::flush_remesh_batch(const uint32_t batch_id) {
+	ZN_PROFILE_SCOPE();
+	StdVector<VoxelEngine::BlockMeshOutput> to_apply;
+	for (size_t i = 0; i < _held_batched_mesh_updates.size();) {
+		if (_held_batched_mesh_updates[i].batch_id == batch_id) {
+			to_apply.push_back(std::move(_held_batched_mesh_updates[i].output));
+			_held_batched_mesh_updates[i] = std::move(_held_batched_mesh_updates.back());
+			_held_batched_mesh_updates.pop_back();
+		} else {
+			++i;
+		}
+	}
+	for (VoxelEngine::BlockMeshOutput &ob : to_apply) {
+		const StdUnorderedMap<Vector3i, RefCount> &queued = _queued_main_thread_mesh_updates[ob.lod];
+		if (queued.find(ob.position) != queued.end()) {
+			continue;
+		}
+		{
+			VoxelLodTerrainUpdateData::Lod &lod = _update_data->state.lods[ob.lod];
+			RWLockRead rlock(lod.mesh_map_state.map_lock);
+			auto it = lod.mesh_map_state.map.find(ob.position);
+			if (it != lod.mesh_map_state.map.end() &&
+				it->second.state == VoxelLodTerrainUpdateData::MESH_UP_TO_DATE) {
+				continue;
+			}
+		}
+		apply_mesh_update(ob);
+	}
+}
+
+// Called every `_process`: stamps batches the main thread has not seen yet, and gives up on the ones that
+// have been waiting longer than `REMESH_BATCH_TIMEOUT_MS` — a member task was cancelled by streaming and its
+// result is never coming. What arrived is applied; the batch stops existing, so stragglers that do show up
+// late take the ordinary path.
+void VoxelLodTerrain::process_remesh_batches() {
+	StdVector<uint32_t> expired;
+	{
+		VoxelLodTerrainUpdateData::State &state = _update_data->state;
+		MutexLock lock(state.remesh_batches_mutex);
+		if (state.remesh_batches.size() == 0) {
+			return;
+		}
+		const uint64_t now = Time::get_singleton()->get_ticks_msec();
+		for (size_t i = 0; i < state.remesh_batches.size();) {
+			VoxelLodTerrainUpdateData::State::RemeshBatch &batch = state.remesh_batches[i];
+			if (batch.first_seen_ms == 0) {
+				batch.first_seen_ms = now;
+				++i;
+			} else if (now - batch.first_seen_ms > REMESH_BATCH_TIMEOUT_MS) {
+				expired.push_back(batch.id);
+				state.remesh_batches.erase(state.remesh_batches.begin() + i);
+			} else {
+				++i;
+			}
+		}
+	}
+	for (const uint32_t id : expired) {
+		flush_remesh_batch(id);
+	}
 }
 
 void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {

@@ -458,6 +458,23 @@ private:
 
 	FixedArray<StdUnorderedMap<Vector3i, RefCount>, constants::MAX_LOD> _queued_main_thread_mesh_updates;
 
+	// Batched remeshes — see `RemeshBatch` in the update data header for what a batch is and why it exists.
+	// Members of a batch bypass the time-spread runner: their outputs are parked here as they arrive and the
+	// whole set is applied in one frame, either when the last member lands (`try_hold_batched_mesh_update`)
+	// or when the batch times out (`process_remesh_batches`). Main thread only.
+	struct HeldBatchedMeshUpdate {
+		uint32_t batch_id;
+		VoxelEngine::BlockMeshOutput output;
+	};
+	StdVector<HeldBatchedMeshUpdate> _held_batched_mesh_updates;
+	// A batch that has not completed in this long has lost a member — a task cancelled by streaming, most
+	// likely — and holding its siblings any longer buys nothing: apply what arrived, let stragglers trickle.
+	static constexpr uint32_t REMESH_BATCH_TIMEOUT_MS = 300;
+
+	bool try_hold_batched_mesh_update(VoxelEngine::BlockMeshOutput &ob);
+	void flush_remesh_batch(uint32_t batch_id);
+	void process_remesh_batches();
+
 #ifdef TOOLS_ENABLED
 	bool _debug_draw_enabled = false;
 	uint8_t _edited_blocks_gizmos_lod_index = 0;

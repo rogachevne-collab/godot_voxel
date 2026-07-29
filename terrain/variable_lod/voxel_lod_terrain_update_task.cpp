@@ -572,8 +572,15 @@ void process_changed_generated_areas(
 		return;
 	}
 
+	// Everything scheduled by this flush is one BATCH — see `RemeshBatch` in the update data header. Whether a
+	// call actually pushed to the pending list is read off the list's size, because `schedule_mesh_update` has
+	// three outcomes (pushed, already pending, merely marked `MESH_NEED_UPDATE` for an invisible block) and only
+	// the first will ever produce a mesh result to wait for.
+	VoxelLodTerrainUpdateData::State::RemeshBatch batch;
+
 	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
 		VoxelLodTerrainUpdateData::Lod &lod = state.lods[lod_index];
+		StdUnorderedSet<Vector3i> &batch_lod = batch.pending_by_lod[lod_index];
 
 		for (auto box_it = state.changed_generated_areas.begin(); box_it != state.changed_generated_areas.end();
 			 ++box_it) {
@@ -584,21 +591,31 @@ void process_changed_generated_areas(
 
 			RWLockRead rlock(lod.mesh_map_state.map_lock);
 
-			bbox.for_each_cell_zxy([&lod](const Vector3i bpos) {
+			bbox.for_each_cell_zxy([&lod, &batch_lod, &batch](const Vector3i bpos) {
 				auto block_it = lod.mesh_map_state.map.find(bpos);
 				if (block_it != lod.mesh_map_state.map.end()) {
+					const size_t before = lod.mesh_blocks_pending_update.size();
 					VoxelLodTerrainUpdateTask::schedule_mesh_update(
 							block_it->second,
 							bpos,
 							lod.mesh_blocks_pending_update,
 							block_it->second.mesh_viewers.get() > 0
 					);
+					if (lod.mesh_blocks_pending_update.size() != before && batch_lod.insert(bpos).second) {
+						++batch.remaining;
+					}
 				}
 			});
 		}
 	}
 
 	state.changed_generated_areas.clear();
+
+	if (batch.remaining > 0) {
+		MutexLock batches_lock(state.remesh_batches_mutex);
+		batch.id = state.next_remesh_batch_id++;
+		state.remesh_batches.push_back(std::move(batch));
+	}
 }
 
 } // namespace
