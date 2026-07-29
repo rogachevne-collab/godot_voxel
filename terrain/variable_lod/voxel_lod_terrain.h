@@ -347,6 +347,15 @@ private:
 
 	LocalCameraInfo get_local_camera_info() const;
 
+	// The only way a mesh block may be destroyed. See the definition for why there is only one.
+	void remove_mesh_block(
+			unsigned int lod_index,
+			Vector3i bpos,
+			bool try_fade_out,
+			const Transform3D &volume_transform,
+			const LocalCameraInfo &camera
+	);
+
 #ifdef TOOLS_ENABLED
 	void update_gizmos();
 #endif

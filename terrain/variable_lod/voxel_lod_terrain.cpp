@@ -929,6 +929,12 @@ void VoxelLodTerrain::reset_mesh_maps() {
 
 		// mesh_map.for_each_block(BeforeUnloadMeshAction{ _shader_material_pool });
 
+		// This one frees every block in the map at once, so it is the third place blocks die. It can't go
+		// through `remove_mesh_block` (the instancer is already told above, and there is nothing to fade into
+		// a map that is about to hold nothing), but the fading registry still points into what is being freed,
+		// and forgetting it here is the same use-after-free by another door.
+		_fading_blocks_per_lod[lod_index].clear();
+
 		// Instance new maps if we have more lods, or clear them otherwise
 		if (lod_index < lod_count) {
 			mesh_map.clear();
@@ -1318,6 +1324,130 @@ void VoxelLodTerrain::process(float delta) {
 	process_fading_blocks(delta);
 }
 
+// Destroys a mesh block, and everything that points at it.
+//
+// There is one of these because there used to be two. Streaming unload erased the block from
+// `_fading_blocks_per_lod` before freeing it; `apply_mesh_update`'s empty-mesh branch freed it without touching
+// that map at all. The map holds raw pointers into the mesh map, so the second path left a dangling one behind,
+// and the next `process_fading_blocks` read `fading_state` out of freed memory and landed in the `CRASH_NOW()`
+// of `update_fading`'s `default:` branch. The two paths meet whenever a camera flies through terrain that is
+// being edited: blocks lose their surface exactly where LOD rings are handing over. Any new site that destroys
+// a mesh block must come through here instead of calling `remove_block` itself.
+//
+// `try_fade_out` asks the dying mesh to dissolve rather than pop. The block itself is about to be freed, so
+// what fades is an independent copy of its mesh handed to `_fading_out_meshes`. Only worth doing for a block
+// that is actually on screen, which is why the camera comes in.
+//
+// Main thread only: it touches the mesh map, the fading registry and the rendering server. Both callers run
+// under `_process` (`apply_main_thread_update_tasks` and `apply_mesh_update`), so no locking is involved.
+void VoxelLodTerrain::remove_mesh_block(
+		const unsigned int lod_index,
+		const Vector3i bpos,
+		const bool try_fade_out,
+		const Transform3D &volume_transform,
+		const LocalCameraInfo &camera
+) {
+	ZN_ASSERT_RETURN(lod_index < _mesh_maps_per_lod.size());
+
+	VoxelMeshMap<VoxelMeshBlockVLT> &mesh_map = _mesh_maps_per_lod[lod_index];
+	StdMap<Vector3i, VoxelMeshBlockVLT *> &fading_blocks_in_current_lod = _fading_blocks_per_lod[lod_index];
+	auto fading_block_it = fading_blocks_in_current_lod.find(bpos);
+
+	if (try_fade_out && _lod_fade_duration > 0.f) {
+		// Trigger fading out if the block was visible.
+		// Since the mesh block is removed from the map, we have to create an independent instance.
+		// If we don't do that and the viewer moves quick enough (or has low enough LOD distance), it would
+		// cause flickering as removed meshes are not able to fade out when moving away from them (contrary to
+		// moving closer to them, because in that case they are not removed, just made invisible).
+		// Other approaches could be explored, such as marking the mesh as "pending removal" and actually
+		// removing it after a second or two, to allow fading to finish.
+
+		// TODO It may be more efficient to just move the mesh instance from the block we are about to
+		// remove, rather than creating another
+
+		const int mesh_block_size = get_mesh_block_size() << lod_index;
+
+		const Vector3 block_center = volume_transform.xform(
+				to_vec3(bpos * mesh_block_size + Vector3iUtil::create(mesh_block_size / 2))
+		);
+
+		// Don't do fading for blocks behind the camera.
+		// TODO The block can extend by its size to be visible by the camera, even more if the camera is moving
+		// backwards. Perhaps we should take this into account.
+		if (camera.forward.dot(block_center - camera.position) > 0.f) {
+			const VoxelMeshBlockVLT *mesh_block = mesh_map.get_block(bpos);
+
+			if (mesh_block != nullptr && mesh_block->is_visible()) {
+				Ref<ShaderMaterial> shader_material = mesh_block->get_shader_material();
+
+				if (shader_material.is_valid()) {
+					FadingOutMesh item;
+
+					item.local_position = mesh_block->position * mesh_block_size;
+
+					if (fading_block_it != fading_blocks_in_current_lod.end()) {
+						if (fading_block_it->second->fading_state == VoxelMeshBlockVLT::FADING_OUT) {
+							// The block was already fading out, take it from here
+							item.progress = fading_block_it->second->fading_progress;
+						} else {
+							// The block was fading in: don't reverse from here.
+							// When a mesh is fading in, there is usually one or multiple others fading out,
+							// resulting in an proper opaque cross-fade. If we reverse fading of this mesh, we
+							// end up with two fading-out meshes: with discard-based fragment shaders, that
+							// means their pixels won't complement each other, causing a noticeable "noisy
+							// hole". So instead we fast-forward to full alpha and then fade out, complementing
+							// the eventually fading-in mesh that causes this (even though there might be
+							// another spurious fading-out mesh, it's better than seeing a hole).
+							// That situation occurs often with transition updates because they are at LOD
+							// borders.
+							item.progress = 1.f;
+						}
+					} else {
+						item.progress = 1.f;
+					}
+
+					// TODO Do we actually have to instantiate a material? We could just re-use the one from the
+					// block, since it gets removed and no change occurs in that material (contrary to
+					// transition mask changes)
+					item.shader_material = _shader_material_pool.allocate();
+					ZN_ASSERT(item.shader_material.is_valid());
+					zylann::godot::copy_shader_params(
+							**shader_material,
+							**item.shader_material,
+							_shader_material_pool.get_cached_shader_uniforms()
+					);
+
+					item.mesh_instance.create();
+					item.mesh_instance.set_interpolated(false);
+					item.mesh_instance.set_mesh(mesh_block->get_mesh());
+					item.mesh_instance.set_gi_mode(get_gi_mode());
+					item.mesh_instance.set_transform(
+							volume_transform * Transform3D(Basis(), item.local_position)
+					);
+					item.mesh_instance.set_material_override(item.shader_material);
+					item.mesh_instance.set_world(*get_world_3d());
+					// TODO What if the terrain is hidden?
+					item.mesh_instance.set_visible(true);
+
+					_fading_out_meshes.push_back(std::move(item));
+				}
+			}
+		}
+	}
+
+	if (fading_block_it != fading_blocks_in_current_lod.end()) {
+		fading_blocks_in_current_lod.erase(fading_block_it);
+	}
+
+	mesh_map.remove_block(bpos, BeforeUnloadMeshAction{ _shader_material_pool });
+
+#ifdef VOXEL_ENABLE_INSTANCER
+	if (_instancer != nullptr) {
+		_instancer->on_mesh_block_exit(bpos, lod_index);
+	}
+#endif
+}
+
 void VoxelLodTerrain::apply_main_thread_update_tasks() {
 	ZN_PROFILE_SCOPE();
 	// Dequeue outputs of the threadable part of the update for actions taking place on the main thread
@@ -1467,100 +1597,8 @@ void VoxelLodTerrain::apply_main_thread_update_tasks() {
 		for (unsigned int i = 0; i < lod.mesh_blocks_to_unload.size(); ++i) {
 			const Vector3i bpos = lod.mesh_blocks_to_unload[i];
 
-			StdMap<Vector3i, VoxelMeshBlockVLT *> &fading_blocks_in_current_lod = _fading_blocks_per_lod[lod_index];
-			auto fading_block_it = fading_blocks_in_current_lod.find(bpos);
+			remove_mesh_block(lod_index, bpos, true, volume_transform, camera);
 
-			if (_lod_fade_duration > 0.f) {
-				// Trigger fading out if the block was visible.
-				// Since the mesh block is removed from the map, we have to create an independent instance.
-				// If we don't do that and the viewer moves quick enough (or has low enough LOD distance), it would
-				// cause flickering as removed meshes are not able to fade out when moving away from them (contrary to
-				// moving closer to them, because in that case they are not removed, just made invisible).
-				// Other approaches could be explored, such as marking the mesh as "pending removal" and actually
-				// removing it after a second or two, to allow fading to finish.
-
-				// TODO It may be more efficient to just move the mesh instance from the block we are about to
-				// remove, rather than creating another
-
-				const Vector3 block_center = volume_transform.xform(
-						to_vec3(bpos * mesh_block_size + Vector3iUtil::create(mesh_block_size / 2))
-				);
-
-				// Don't do fading for blocks behind the camera.
-				// TODO The block can extend by its size to be visible by the camera, even more if the camera is moving
-				// backwards. Perhaps we should take this into account.
-				if (camera.forward.dot(block_center - camera.position) > 0.f) {
-					const VoxelMeshBlockVLT *mesh_block = mesh_map.get_block(bpos);
-
-					if (mesh_block != nullptr && mesh_block->is_visible()) {
-						Ref<ShaderMaterial> shader_material = mesh_block->get_shader_material();
-
-						if (shader_material.is_valid()) {
-							FadingOutMesh item;
-
-							item.local_position = mesh_block->position * mesh_block_size;
-
-							if (fading_block_it != fading_blocks_in_current_lod.end()) {
-								if (fading_block_it->second->fading_state == VoxelMeshBlockVLT::FADING_OUT) {
-									// The block was already fading out, take it from here
-									item.progress = fading_block_it->second->fading_progress;
-								} else {
-									// The block was fading in: don't reverse from here.
-									// When a mesh is fading in, there is usually one or multiple others fading out,
-									// resulting in an proper opaque cross-fade. If we reverse fading of this mesh, we
-									// end up with two fading-out meshes: with discard-based fragment shaders, that
-									// means their pixels won't complement each other, causing a noticeable "noisy
-									// hole". So instead we fast-forward to full alpha and then fade out, complementing
-									// the eventually fading-in mesh that causes this (even though there might be
-									// another spurious fading-out mesh, it's better than seeing a hole).
-									// That situation occurs often with transition updates because they are at LOD
-									// borders.
-									item.progress = 1.f;
-								}
-							} else {
-								item.progress = 1.f;
-							}
-
-							// TODO Do we actually have to instantiate a material? We could just re-use the one from the
-							// block, since it gets removed and no change occurs in that material (contrary to
-							// transition mask changes)
-							item.shader_material = _shader_material_pool.allocate();
-							ZN_ASSERT(item.shader_material.is_valid());
-							zylann::godot::copy_shader_params(
-									**shader_material,
-									**item.shader_material,
-									_shader_material_pool.get_cached_shader_uniforms()
-							);
-
-							item.mesh_instance.create();
-							item.mesh_instance.set_interpolated(false);
-							item.mesh_instance.set_mesh(mesh_block->get_mesh());
-							item.mesh_instance.set_gi_mode(get_gi_mode());
-							item.mesh_instance.set_transform(
-									volume_transform * Transform3D(Basis(), item.local_position)
-							);
-							item.mesh_instance.set_material_override(item.shader_material);
-							item.mesh_instance.set_world(*get_world_3d());
-							// TODO What if the terrain is hidden?
-							item.mesh_instance.set_visible(true);
-
-							_fading_out_meshes.push_back(std::move(item));
-						}
-					}
-				}
-			}
-
-			if (fading_block_it != fading_blocks_in_current_lod.end()) {
-				fading_blocks_in_current_lod.erase(fading_block_it);
-			}
-
-			mesh_map.remove_block(bpos, BeforeUnloadMeshAction{ _shader_material_pool });
-
-#ifdef VOXEL_ENABLE_INSTANCER
-			if (_instancer != nullptr) {
-				_instancer->on_mesh_block_exit(bpos, lod_index);
-			}
-#endif
 			/*
 #ifdef DEBUG_ENABLED
 			debug_removed_blocks.insert(bpos);
@@ -1964,15 +2002,11 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		ob.surfaces.collision_surface.indices.size() == 0) {
 		// The mesh is empty
 		if (block != nullptr) {
-			// No surface anymore in this block, destroy it
-			// TODO Factor removal in a function, it's done in a few places
-			mesh_map.remove_block(ob.position, BeforeUnloadMeshAction{ _shader_material_pool });
-
-#ifdef VOXEL_ENABLE_INSTANCER
-			if (_instancer != nullptr) {
-				_instancer->on_mesh_block_exit(ob.position, ob.lod);
-			}
-#endif
+			// No surface anymore in this block, destroy it.
+			// This has to go through the same door as streaming unload: the block may be fading right now, and
+			// leaving it in `_fading_blocks_per_lod` after it is freed is a use-after-free the next frame. Fading
+			// out is asked for, so ground that an edit has eaten dissolves instead of blinking away.
+			remove_mesh_block(ob.lod, ob.position, true, get_global_transform(), get_local_camera_info());
 		}
 		// ZN_PRINT_VERBOSE(format("Empty block pos {} lod {} time {}", ob.position, int(ob.lod),
 		// 		Time::get_singleton()->get_ticks_msec()));
