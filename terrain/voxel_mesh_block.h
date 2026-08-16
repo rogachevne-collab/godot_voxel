@@ -67,6 +67,13 @@ public:
 
 	void set_collision_shape(Ref<Shape3D> shape, bool debug_collision, const Node3D *node, float margin);
 	bool has_collision_shape() const;
+	// The shape as it was handed to physics. A reference, not a second copy of the triangles: the shape is
+	// alive anyway for as long as the body holds it, so this costs one pointer. It exists so a consumer that
+	// needs the same ground in another form — navigation baking — can ask for it when it wants it, instead
+	// of every mesh update pushing a copy of its geometry at everyone who might be listening.
+	Ref<Shape3D> get_collision_shape() const {
+		return _collision_shape;
+	}
 	void set_collision_layer(int layer);
 	void set_collision_mask(int mask);
 	void set_collision_margin(float margin);
@@ -91,6 +98,7 @@ protected:
 
 	zylann::godot::DirectMeshInstance _mesh_instance;
 	zylann::godot::DirectStaticBody _static_body;
+	Ref<Shape3D> _collision_shape;
 	Ref<World3D> _world;
 
 	// Must match default value of `active`

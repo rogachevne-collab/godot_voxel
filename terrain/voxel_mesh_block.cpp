@@ -168,6 +168,7 @@ void VoxelMeshBlock::set_collision_shape(Ref<Shape3D> shape, bool debug_collisio
 	_static_body.add_shape(shape);
 	_static_body.set_debug(debug_collision, *_world);
 	_static_body.set_shape_enabled(0, _collision_enabled);
+	_collision_shape = shape;
 }
 
 bool VoxelMeshBlock::has_collision_shape() const {
@@ -199,6 +200,7 @@ void VoxelMeshBlock::drop_collision() {
 	if (_static_body.is_valid()) {
 		_static_body.destroy();
 	}
+	_collision_shape.unref();
 }
 
 void VoxelMeshBlock::set_collision_enabled(bool enable) {

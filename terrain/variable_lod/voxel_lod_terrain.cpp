@@ -14,6 +14,7 @@
 #include "../../util/godot/classes/camera_3d.h"
 #include "../../util/godot/classes/concave_polygon_shape_3d.h"
 #include "../../util/godot/classes/engine.h"
+#include "../../util/godot/classes/mesh.h"
 #include "../../util/godot/classes/mesh_instance_3d.h"
 #include "../../util/godot/classes/node.h"
 #include "../../util/godot/classes/packed_scene.h"
@@ -1449,11 +1450,50 @@ void VoxelLodTerrain::remove_mesh_block(
 
 	mesh_map.remove_block(bpos, BeforeUnloadMeshAction{ _shader_material_pool });
 
+	// The other half of the navigation seam. Every path that destroys a mesh block comes through this function
+	// (see the comment above it), so one emission here covers streaming unload and emptied-by-an-edit alike. A
+	// listener that never saw the block simply ignores it.
+	static const StringName s_mesh_block_unloaded("mesh_block_unloaded");
+	if (has_connections(s_mesh_block_unloaded)) {
+		emit_signal(s_mesh_block_unloaded, bpos, static_cast<int>(lod_index));
+	}
+
 #ifdef VOXEL_ENABLE_INSTANCER
 	if (_instancer != nullptr) {
 		_instancer->on_mesh_block_exit(bpos, lod_index);
 	}
 #endif
+}
+
+// Says that this block's collider is now the one physics has. See `get_mesh_block_collision_faces` for why
+// nothing is carried along.
+void VoxelLodTerrain::notify_mesh_block_collider(const Vector3i bpos, const unsigned int lod_index) {
+	static const StringName s_mesh_block_updated("mesh_block_updated");
+	if (has_connections(s_mesh_block_updated)) {
+		emit_signal(s_mesh_block_updated, bpos, static_cast<int>(lod_index));
+	}
+}
+
+// The collision triangles of one block, in the block's own space, already de-indexed — the same form the
+// physics engine got them in, because it IS what physics got. Empty if that block has no collider.
+//
+// Pull and not push: streaming emits `mesh_block_updated` several times per frame across a wide radius, and a
+// consumer typically wants a fraction of that. Handing every listener a copy of every block cost a array copy
+// per emission on the main thread; this way the copy happens once, for the blocks somebody asked about.
+PackedVector3Array VoxelLodTerrain::get_mesh_block_collision_faces(const Vector3i bpos, const int lod_index) const {
+	PackedVector3Array faces;
+	ERR_FAIL_COND_V(lod_index < 0, faces);
+	ERR_FAIL_COND_V(static_cast<unsigned int>(lod_index) >= _mesh_maps_per_lod.size(), faces);
+	const VoxelMeshMap<VoxelMeshBlockVLT> &mesh_map = _mesh_maps_per_lod[lod_index];
+	const VoxelMeshBlockVLT *block = mesh_map.get_block(bpos);
+	if (block == nullptr) {
+		return faces;
+	}
+	Ref<ConcavePolygonShape3D> shape = block->get_collision_shape();
+	if (shape.is_null()) {
+		return faces;
+	}
+	return shape->get_faces();
 }
 
 void VoxelLodTerrain::apply_main_thread_update_tasks() {
@@ -2296,6 +2336,12 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 			Ref<Shape3D> collision_shape = make_collision_shape_from_mesher_output(ob.surfaces, **_mesher);
 			set_block_collision_shape(*this, *block, collision_shape, now);
 			block->set_collision_enabled(collision_active);
+			// The navigation seam: this block's collider just changed. Carries no geometry on purpose — a
+			// listener that wants the triangles calls `get_mesh_block_collision_faces` for the blocks it
+			// actually cares about. Terrain streaming emits this several times per frame, and most of those
+			// blocks are of no interest to anyone; a copy of every one of them was pure waste on the main
+			// thread.
+			notify_mesh_block_collider(ob.position, ob.lod);
 
 		} else {
 			if (block->deferred_collider_data == nullptr) {
@@ -2548,6 +2594,9 @@ void VoxelLodTerrain::process_deferred_collision_updates(uint32_t timeout_msec) 
 				}
 
 				set_block_collision_shape(*this, *block, collision_shape, now);
+				// The delayed collider is still a collider change: a listener that skipped this block when the
+				// mesh arrived would otherwise never hear that its ground finally settled.
+				notify_mesh_block_collider(block_pos, lod_index);
 
 				unordered_remove(deferred_collision_updates, i);
 				--i;
@@ -4358,6 +4407,24 @@ void VoxelLodTerrain::_bind_methods() {
 			"debug_set_draw_shadow_occluders",
 			"debug_get_draw_shadow_occluders"
 	);
+
+	// This block's collider changed. Deliberately carries no geometry: call `get_mesh_block_collision_faces`
+	// for the blocks you actually want, and you get their triangles in the block's own space (multiply by the
+	// terrain transform and the block origin — `position * mesh_block_size` — for world space). Emitted per LOD
+	// that carries collision, so a listener that only wants LOD0 filters on `lod` itself.
+	ClassDB::bind_method(
+			D_METHOD("get_mesh_block_collision_faces", "block_position", "lod"),
+			&VoxelLodTerrain::get_mesh_block_collision_faces
+	);
+
+	ADD_SIGNAL(MethodInfo(
+			"mesh_block_updated",
+			PropertyInfo(Variant::VECTOR3I, "position"),
+			PropertyInfo(Variant::INT, "lod")
+	));
+	ADD_SIGNAL(MethodInfo(
+			"mesh_block_unloaded", PropertyInfo(Variant::VECTOR3I, "position"), PropertyInfo(Variant::INT, "lod")
+	));
 }
 
 } // namespace zylann::voxel

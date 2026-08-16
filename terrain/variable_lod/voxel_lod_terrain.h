@@ -92,6 +92,10 @@ public:
 	unsigned int get_mesh_block_size() const;
 	void set_mesh_block_size(unsigned int mesh_block_size);
 
+	// The navigation seam's pull side — see the definition, and the `mesh_block_updated` signal that tells you
+	// when it is worth calling.
+	PackedVector3Array get_mesh_block_collision_faces(Vector3i bpos, int lod_index) const;
+
 	void set_full_load_mode_enabled(bool enabled);
 	bool is_full_load_mode_enabled() const;
 
@@ -346,6 +350,8 @@ private:
 	};
 
 	LocalCameraInfo get_local_camera_info() const;
+
+	void notify_mesh_block_collider(Vector3i bpos, unsigned int lod_index);
 
 	// The only way a mesh block may be destroyed. See the definition for why there is only one.
 	void remove_mesh_block(
