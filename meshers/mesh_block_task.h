@@ -95,6 +95,7 @@ private:
 #endif
 	VoxelBuffer _voxels;
 	VoxelMesher::Output _surfaces_output;
+	PackedVector3Array _collision_faces;
 	Ref<Mesh> _mesh;
 	Ref<Mesh> _shadow_occluder_mesh;
 	StdVector<uint16_t> _mesh_material_indices; // Indexed by mesh surface

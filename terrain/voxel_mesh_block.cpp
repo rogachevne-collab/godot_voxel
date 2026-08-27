@@ -270,4 +270,58 @@ Ref<ConcavePolygonShape3D> make_collision_shape_from_mesher_output(
 	return shape;
 }
 
+PackedVector3Array make_collision_faces_from_mesher_output(
+		const VoxelMesher::Output &mesher_output,
+		const VoxelMesher &mesher
+) {
+	using namespace zylann::godot;
+
+	if (mesher.is_generating_collision_surface()) {
+		if (mesher_output.collision_surface.submesh_vertex_end != -1) {
+			if (mesher_output.surfaces.size() == 0) {
+				return PackedVector3Array();
+			}
+			const Array &arrays = mesher_output.surfaces[0].arrays;
+			if (arrays.size() == 0) {
+				return PackedVector3Array();
+			}
+			const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
+			const PackedInt32Array indices = arrays[Mesh::ARRAY_INDEX];
+			return deindex_mesh_to_packed_vector3_array(
+					to_span(positions).sub(0, mesher_output.collision_surface.submesh_vertex_end),
+					to_span(indices).sub(0, mesher_output.collision_surface.submesh_index_end)
+			);
+		}
+		return deindex_mesh_to_packed_vector3_array(
+				to_span(mesher_output.collision_surface.positions),
+				to_span(mesher_output.collision_surface.indices)
+		);
+	}
+
+	int face_count = 0;
+	for (const VoxelMesher::Output::Surface &surface : mesher_output.surfaces) {
+		if (surface.arrays.size() != 0) {
+			const PackedInt32Array indices = surface.arrays[Mesh::ARRAY_INDEX];
+			face_count += indices.size();
+		}
+	}
+	PackedVector3Array faces;
+	faces.resize(face_count);
+	Vector3 *write = faces.ptrw();
+	int offset = 0;
+	for (const VoxelMesher::Output::Surface &surface : mesher_output.surfaces) {
+		if (surface.arrays.size() == 0) {
+			continue;
+		}
+		const PackedVector3Array positions = surface.arrays[Mesh::ARRAY_VERTEX];
+		const PackedInt32Array indices = surface.arrays[Mesh::ARRAY_INDEX];
+		const Vector3 *position_read = positions.ptr();
+		const int32_t *index_read = indices.ptr();
+		for (int i = 0; i < indices.size(); ++i) {
+			write[offset++] = position_read[index_read[i]];
+		}
+	}
+	return faces;
+}
+
 } // namespace zylann::voxel

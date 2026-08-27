@@ -516,6 +516,9 @@ void MeshBlockTask::build_mesh() {
 		true // detail_texture_hint
 	};
 	mesher->build(_surfaces_output, input);
+	if (collision_hint) {
+		_collision_faces = make_collision_faces_from_mesher_output(_surfaces_output, **mesher);
+	}
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 	const bool mesh_is_empty = VoxelMesher::is_mesh_empty(_surfaces_output.surfaces);
@@ -635,6 +638,7 @@ void MeshBlockTask::apply_result() {
 			o.position = mesh_block_position;
 			o.lod = lod_index;
 			o.surfaces = std::move(_surfaces_output);
+			o.collision_faces = std::move(_collision_faces);
 			o.mesh = _mesh;
 			o.shadow_occluder_mesh = _shadow_occluder_mesh;
 			o.mesh_material_indices = std::move(_mesh_material_indices);

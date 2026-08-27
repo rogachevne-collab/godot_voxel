@@ -430,6 +430,7 @@ Ref<VoxelMesher> VoxelLodTerrain::get_mesher() const {
 }
 
 void VoxelLodTerrain::_on_stream_params_changed() {
+	clear_collision_cache();
 	stop_streamer();
 	stop_updater();
 
@@ -620,6 +621,9 @@ void VoxelLodTerrain::set_mesh_block_visual_active(
 // The provided box must be at LOD0 coordinates.
 void VoxelLodTerrain::post_edit_area(Box3i p_box, bool update_mesh) {
 	ZN_PROFILE_SCOPE();
+	if (update_mesh) {
+		invalidate_collision_cache(p_box);
+	}
 	{
 		MutexLock lock(_update_data->state.edit_notifications.mutex);
 		_data->mark_area_modified(p_box, &_update_data->state.edit_notifications.edited_blocks_lod0, update_mesh);
@@ -1493,7 +1497,19 @@ PackedVector3Array VoxelLodTerrain::get_mesh_block_collision_faces(const Vector3
 	if (shape.is_null()) {
 		return faces;
 	}
-	return shape->get_faces();
+	const Variant shape_data_variant = PhysicsServer3D::get_singleton()->shape_get_data(shape->get_rid());
+	if (shape_data_variant.get_type() != Variant::DICTIONARY) {
+		return faces;
+	}
+
+	const Dictionary shape_data = shape_data_variant;
+	const Variant maybe_faces = shape_data.get("faces", Variant());
+	if (maybe_faces.get_type() != Variant::PACKED_VECTOR3_ARRAY) {
+		return faces;
+	}
+
+	faces = maybe_faces;
+	return faces;
 }
 
 void VoxelLodTerrain::apply_main_thread_update_tasks() {
@@ -1639,6 +1655,7 @@ void VoxelLodTerrain::apply_main_thread_update_tasks() {
 			}
 			block->drop_collision();
 			block->set_collision_enabled(false);
+			block->collision_requested = false;
 		}
 		lod.mesh_blocks_to_drop_collision.clear();
 
@@ -1915,7 +1932,190 @@ inline void set_block_collision_shape(
 	block.set_collision_layer(terrain.get_collision_layer());
 	block.set_collision_mask(terrain.get_collision_mask());
 	block.last_collider_update_time = now;
-	block.deferred_collider_data.reset();
+	block.deferred_collider_faces = PackedVector3Array();
+	block.has_deferred_collider_faces = false;
+}
+
+uint64_t VoxelLodTerrain::get_collision_revision(Vector3i block_position) const {
+	const auto it = _collision_revisions.find(block_position);
+	return it == _collision_revisions.end() ? 0 : it->second;
+}
+
+void VoxelLodTerrain::invalidate_collision_cache(Box3i voxel_box) {
+	const Box3i block_box = voxel_box.downscaled(get_mesh_block_size()).padded(1);
+	const Vector3i end = block_box.position + block_box.size;
+	for (int z = block_box.position.z; z < end.z; ++z) {
+		for (int x = block_box.position.x; x < end.x; ++x) {
+			for (int y = block_box.position.y; y < end.y; ++y) {
+				const Vector3i bpos(x, y, z);
+				++_collision_revisions[bpos];
+
+				auto cache_it = _collision_cache.find(bpos);
+				if (cache_it != _collision_cache.end()) {
+					CollisionCacheEntry &entry = cache_it->second;
+					_collision_cache_triangle_count -= entry.triangle_count;
+					if (entry.state == CollisionCacheEntry::PENDING) {
+						++_stats.collision_cook_stale;
+						if (_stats.collision_cook_pending > 0) {
+							--_stats.collision_cook_pending;
+						}
+					}
+					_collision_cache.erase(cache_it);
+					++_stats.collision_cache_invalidated;
+				}
+
+				VoxelMeshBlockVLT *block = _mesh_maps_per_lod[0].get_block(bpos);
+				if (block != nullptr) {
+					block->deferred_collider_faces = PackedVector3Array();
+					block->has_deferred_collider_faces = false;
+				}
+			}
+		}
+	}
+}
+
+void VoxelLodTerrain::clear_collision_cache() {
+	for (const auto &it : _collision_cache) {
+		if (it.second.state == CollisionCacheEntry::PENDING) {
+			++_stats.collision_cook_stale;
+		}
+	}
+	_collision_cache.clear();
+	_collision_revisions.clear();
+	_collision_cache_triangle_count = 0;
+	_stats.collision_cook_pending = 0;
+}
+
+void VoxelLodTerrain::trim_collision_cache() {
+	while (_collision_cache.size() > COLLISION_CACHE_MAX_ENTRIES ||
+			_collision_cache_triangle_count > COLLISION_CACHE_MAX_TRIANGLES) {
+		auto victim = _collision_cache.end();
+		for (auto it = _collision_cache.begin(); it != _collision_cache.end(); ++it) {
+			CollisionCacheEntry &entry = it->second;
+			if (entry.state == CollisionCacheEntry::PENDING) {
+				continue;
+			}
+			VoxelMeshBlockVLT *block = _mesh_maps_per_lod[0].get_block(it->first);
+			if (block != nullptr && entry.shape.is_valid() && block->get_collision_shape() == entry.shape) {
+				continue;
+			}
+			if (victim == _collision_cache.end() || entry.last_used < victim->second.last_used) {
+				victim = it;
+			}
+		}
+		if (victim == _collision_cache.end()) {
+			break;
+		}
+		_collision_cache_triangle_count -= victim->second.triangle_count;
+		_collision_cache.erase(victim);
+	}
+}
+
+void VoxelLodTerrain::queue_collision_cook(
+		Vector3i block_position,
+		PackedVector3Array faces,
+		bool collision_active,
+		uint64_t now
+) {
+	VoxelMeshBlockVLT *block = _mesh_maps_per_lod[0].get_block(block_position);
+	if (block == nullptr || !block->collision_requested) {
+		return;
+	}
+	block->set_collision_enabled(collision_active);
+	block->last_collider_update_time = now;
+	block->deferred_collider_faces = PackedVector3Array();
+	block->has_deferred_collider_faces = false;
+
+	const uint64_t revision = get_collision_revision(block_position);
+	auto it = _collision_cache.find(block_position);
+	if (it != _collision_cache.end() && it->second.revision == revision) {
+		CollisionCacheEntry &entry = it->second;
+		entry.last_used = ++_collision_cache_clock;
+		++_stats.collision_cache_hit;
+		if (entry.state == CollisionCacheEntry::READY) {
+			set_block_collision_shape(*this, *block, entry.shape, now);
+			notify_mesh_block_collider(block_position, 0);
+		}
+		return;
+	}
+
+	if (it != _collision_cache.end()) {
+		_collision_cache_triangle_count -= it->second.triangle_count;
+		if (it->second.state == CollisionCacheEntry::PENDING) {
+			++_stats.collision_cook_stale;
+			if (_stats.collision_cook_pending > 0) {
+				--_stats.collision_cook_pending;
+			}
+		}
+		_collision_cache.erase(it);
+	}
+
+	++_stats.collision_cache_miss;
+	CollisionCacheEntry entry;
+	entry.revision = revision;
+	entry.generation = ++_collision_generation;
+	entry.last_used = ++_collision_cache_clock;
+	entry.triangle_count = faces.size() / 3;
+	_collision_cache_triangle_count += entry.triangle_count;
+
+	if (faces.is_empty()) {
+		entry.state = CollisionCacheEntry::READY;
+	} else {
+		entry.shape = zylann::godot::create_async_concave_polygon_shape(faces, entry.generation);
+		const zylann::godot::AsyncConcaveShapeStatus status =
+				zylann::godot::get_async_concave_polygon_shape_status(entry.shape, entry.generation);
+		if (status == zylann::godot::ASYNC_CONCAVE_PENDING) {
+			entry.state = CollisionCacheEntry::PENDING;
+			++_stats.collision_cook_pending;
+		} else if (status == zylann::godot::ASYNC_CONCAVE_READY) {
+			entry.state = CollisionCacheEntry::READY;
+			++_stats.collision_cook_completed;
+		} else {
+			entry.state = CollisionCacheEntry::FAILED;
+		}
+	}
+
+	auto inserted = _collision_cache.insert({ block_position, entry }).first;
+	if (inserted->second.state == CollisionCacheEntry::READY) {
+		set_block_collision_shape(*this, *block, inserted->second.shape, now);
+		notify_mesh_block_collider(block_position, 0);
+	}
+	trim_collision_cache();
+}
+
+void VoxelLodTerrain::process_collision_cache() {
+	for (auto &it : _collision_cache) {
+		CollisionCacheEntry &entry = it.second;
+		if (entry.state != CollisionCacheEntry::PENDING) {
+			continue;
+		}
+		const zylann::godot::AsyncConcaveShapeStatus status =
+				zylann::godot::get_async_concave_polygon_shape_status(entry.shape, entry.generation);
+		if (status == zylann::godot::ASYNC_CONCAVE_PENDING) {
+			continue;
+		}
+		if (_stats.collision_cook_pending > 0) {
+			--_stats.collision_cook_pending;
+		}
+		if (status == zylann::godot::ASYNC_CONCAVE_FAILED) {
+			entry.state = CollisionCacheEntry::FAILED;
+			++_stats.collision_cook_stale;
+			continue;
+		}
+
+		entry.state = CollisionCacheEntry::READY;
+		++_stats.collision_cook_completed;
+		if (entry.revision != get_collision_revision(it.first)) {
+			++_stats.collision_cook_stale;
+			continue;
+		}
+		VoxelMeshBlockVLT *block = _mesh_maps_per_lod[0].get_block(it.first);
+		if (block != nullptr && block->collision_requested) {
+			set_block_collision_shape(*this, *block, entry.shape, get_ticks_msec());
+			notify_mesh_block_collider(it.first, 0);
+		}
+	}
+	trim_collision_cache();
 }
 
 // Main thread (the mesh output callback runs from `VoxelEngine::process`). Parks the output if it belongs to
@@ -2064,6 +2264,7 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	bool first_visual_load = false;
 	bool visual_expected = false;
 	bool collision_expected = false;
+	bool mesh_update_current = false;
 	{
 		VoxelLodTerrainUpdateData::Lod &lod = update_data.state.lods[ob.lod];
 		RWLockRead rlock(lod.mesh_map_state.map_lock);
@@ -2089,7 +2290,8 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		// The state can become "up to date" only if no other unsent update was pending.
 		VoxelLodTerrainUpdateData::MeshState expected = VoxelLodTerrainUpdateData::MESH_UPDATE_SENT;
 		// TODO We need to separate visuals from collider
-		mesh_block_state.state.compare_exchange_strong(expected, VoxelLodTerrainUpdateData::MESH_UP_TO_DATE);
+		mesh_update_current =
+				mesh_block_state.state.compare_exchange_strong(expected, VoxelLodTerrainUpdateData::MESH_UP_TO_DATE);
 		visual_active = mesh_block_state.visual_active;
 		collision_active = mesh_block_state.collision_active;
 
@@ -2327,28 +2529,26 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		has_collision = ob.lod < _collision_lod_count;
 	}
 
-	if (has_collision && collision_expected) {
+	if (has_collision && collision_expected && mesh_update_current) {
 		const uint64_t now = get_ticks_msec();
+		block->collision_requested = true;
+		block->set_collision_enabled(collision_active);
 
 		if (_collision_update_delay == 0 ||
 			static_cast<int>(now - block->last_collider_update_time) > _collision_update_delay) {
-			ZN_ASSERT(_mesher.is_valid());
-			Ref<Shape3D> collision_shape = make_collision_shape_from_mesher_output(ob.surfaces, **_mesher);
-			set_block_collision_shape(*this, *block, collision_shape, now);
-			block->set_collision_enabled(collision_active);
+			queue_collision_cook(ob.position, std::move(ob.collision_faces), collision_active, now);
 			// The navigation seam: this block's collider just changed. Carries no geometry on purpose — a
 			// listener that wants the triangles calls `get_mesh_block_collision_faces` for the blocks it
 			// actually cares about. Terrain streaming emits this several times per frame, and most of those
 			// blocks are of no interest to anyone; a copy of every one of them was pure waste on the main
 			// thread.
-			notify_mesh_block_collider(ob.position, ob.lod);
 
 		} else {
-			if (block->deferred_collider_data == nullptr) {
+			if (!block->has_deferred_collider_faces) {
 				_deferred_collision_updates_per_lod[ob.lod].push_back(ob.position);
-				block->deferred_collider_data = make_unique_instance<VoxelMesher::Output>();
+				block->has_deferred_collider_faces = true;
 			}
-			*block->deferred_collider_data = std::move(ob.surfaces);
+			block->deferred_collider_faces = std::move(ob.collision_faces);
 		}
 	}
 
@@ -2564,6 +2764,7 @@ void VoxelLodTerrain::apply_detail_texture_update_to_block(
 
 void VoxelLodTerrain::process_deferred_collision_updates(uint32_t timeout_msec) {
 	ZN_PROFILE_SCOPE();
+	process_collision_cache();
 
 	const unsigned int lod_count = get_lod_count();
 	// TODO We may move this in a time spread task somehow, the timeout does not account for them so could take longer
@@ -2577,7 +2778,7 @@ void VoxelLodTerrain::process_deferred_collision_updates(uint32_t timeout_msec) 
 			const Vector3i block_pos = deferred_collision_updates[i];
 			VoxelMeshBlockVLT *block = mesh_map.get_block(block_pos);
 
-			if (block == nullptr || block->deferred_collider_data == nullptr) {
+			if (block == nullptr || !block->has_deferred_collider_faces) {
 				// Block was unloaded or no longer needs a collision update
 				unordered_remove(deferred_collision_updates, i);
 				--i;
@@ -2587,16 +2788,12 @@ void VoxelLodTerrain::process_deferred_collision_updates(uint32_t timeout_msec) 
 			const uint64_t now = get_ticks_msec();
 
 			if (static_cast<int>(now - block->last_collider_update_time) > _collision_update_delay) {
-				Ref<Shape3D> collision_shape;
-				if (_mesher.is_valid()) {
-					collision_shape =
-							make_collision_shape_from_mesher_output(*block->deferred_collider_data, **_mesher);
-				}
-
-				set_block_collision_shape(*this, *block, collision_shape, now);
-				// The delayed collider is still a collider change: a listener that skipped this block when the
-				// mesh arrived would otherwise never hear that its ground finally settled.
-				notify_mesh_block_collider(block_pos, lod_index);
+				queue_collision_cook(
+						block_pos,
+						std::move(block->deferred_collider_faces),
+						block->is_collision_enabled(),
+						now
+				);
 
 				unordered_remove(deferred_collision_updates, i);
 				--i;
@@ -2876,6 +3073,12 @@ Dictionary VoxelLodTerrain::_b_get_statistics() const {
 	// Process
 	d["dropped_block_loads"] = _stats.dropped_block_loads;
 	d["dropped_block_meshs"] = _stats.dropped_block_meshs;
+	d["collision_cache_hit"] = _stats.collision_cache_hit;
+	d["collision_cache_miss"] = _stats.collision_cache_miss;
+	d["collision_cache_invalidated"] = _stats.collision_cache_invalidated;
+	d["collision_cook_pending"] = _stats.collision_cook_pending;
+	d["collision_cook_stale"] = _stats.collision_cook_stale;
+	d["collision_cook_completed"] = _stats.collision_cook_completed;
 
 	return d;
 }
@@ -2909,6 +3112,7 @@ void VoxelLodTerrain::restart_stream() {
 
 void VoxelLodTerrain::remesh_all_blocks() {
 	// Requests a new mesh for all mesh blocks, without dropping everything first
+	clear_collision_cache();
 	_update_data->wait_for_end_of_task();
 	const unsigned int lod_count = get_lod_count();
 	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {

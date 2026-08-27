@@ -196,6 +196,12 @@ public:
 		// Total time spent in the last update task, in microseconds.
 		// This only includes the threadable part, not the whole `process` function.
 		uint32_t time_update_task = 0;
+		uint64_t collision_cache_hit = 0;
+		uint64_t collision_cache_miss = 0;
+		uint64_t collision_cache_invalidated = 0;
+		uint64_t collision_cook_pending = 0;
+		uint64_t collision_cook_stale = 0;
+		uint64_t collision_cook_completed = 0;
 	};
 
 	const Stats &get_stats() const;
@@ -342,6 +348,17 @@ private:
 	void save_all_modified_blocks(bool with_copy, std::shared_ptr<AsyncDependencyTracker> tracker);
 
 	void process_deferred_collision_updates(uint32_t timeout_msec);
+	void process_collision_cache();
+	void queue_collision_cook(
+			Vector3i block_position,
+			PackedVector3Array faces,
+			bool collision_active,
+			uint64_t now
+	);
+	void invalidate_collision_cache(Box3i voxel_box);
+	void clear_collision_cache();
+	void trim_collision_cache();
+	uint64_t get_collision_revision(Vector3i block_position) const;
 	void process_fading_blocks(float delta);
 
 	struct LocalCameraInfo {
@@ -426,6 +443,27 @@ private:
 	float _collision_margin = constants::DEFAULT_COLLISION_MARGIN;
 	int _collision_update_delay = 0;
 	FixedArray<StdVector<Vector3i>, constants::MAX_LOD> _deferred_collision_updates_per_lod;
+
+	struct CollisionCacheEntry {
+		enum State {
+			PENDING,
+			READY,
+			FAILED,
+		};
+		Ref<ConcavePolygonShape3D> shape;
+		uint64_t revision = 0;
+		uint64_t generation = 0;
+		uint64_t last_used = 0;
+		uint32_t triangle_count = 0;
+		State state = PENDING;
+	};
+	static constexpr uint32_t COLLISION_CACHE_MAX_ENTRIES = 256;
+	static constexpr uint32_t COLLISION_CACHE_MAX_TRIANGLES = 1000000;
+	StdMap<Vector3i, CollisionCacheEntry> _collision_cache;
+	StdMap<Vector3i, uint64_t> _collision_revisions;
+	uint64_t _collision_cache_clock = 0;
+	uint64_t _collision_generation = 0;
+	uint64_t _collision_cache_triangle_count = 0;
 
 	float _lod_fade_duration = 0.f;
 	// Note, direct pointers to mesh blocks should be safe because these blocks are always destroyed from the same

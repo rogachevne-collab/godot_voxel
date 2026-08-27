@@ -4,6 +4,7 @@
 #include "../../containers/span.h"
 #include "../../macros.h"
 #include "../../math/vector3f.h"
+#include "physics_server_3d.h"
 
 #if defined(ZN_GODOT)
 #include <core/version.h>
@@ -34,6 +35,32 @@ Ref<ConcavePolygonShape3D> create_concave_polygon_shape(
 		const Array &surface_arrays,
 		const unsigned int vertex_count,
 		const unsigned int index_count
+);
+
+PackedVector3Array deindex_mesh_to_packed_vector3_array(
+		const Span<const Vector3f> positions,
+		const Span<const int> indices
+);
+
+PackedVector3Array deindex_mesh_to_packed_vector3_array(
+		const Span<const Vector3> positions,
+		const Span<const int32_t> indices
+);
+
+enum AsyncConcaveShapeStatus {
+	ASYNC_CONCAVE_PENDING,
+	ASYNC_CONCAVE_READY,
+	ASYNC_CONCAVE_FAILED,
+};
+
+Ref<ConcavePolygonShape3D> create_async_concave_polygon_shape(
+		const PackedVector3Array &faces,
+		uint64_t generation
+);
+
+AsyncConcaveShapeStatus get_async_concave_polygon_shape_status(
+		const Ref<ConcavePolygonShape3D> &shape,
+		uint64_t generation
 );
 
 } // namespace zylann::godot

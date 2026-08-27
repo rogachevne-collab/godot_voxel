@@ -37,7 +37,9 @@ public:
 	uint8_t detail_texture_fallback_level = 0;
 
 	uint64_t last_collider_update_time = 0;
-	UniquePtr<VoxelMesher::Output> deferred_collider_data;
+	PackedVector3Array deferred_collider_faces;
+	bool has_deferred_collider_faces = false;
+	bool collision_requested = false;
 
 	int32_t col_vertex_end = -1;
 	int32_t col_index_end = -1;

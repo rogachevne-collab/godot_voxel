@@ -187,4 +187,54 @@ Ref<ConcavePolygonShape3D> create_concave_polygon_shape(
 	return shape;
 }
 
+Ref<ConcavePolygonShape3D> create_async_concave_polygon_shape(
+		const PackedVector3Array &faces,
+		uint64_t generation
+) {
+	Ref<ConcavePolygonShape3D> shape;
+	if (faces.size() < 3) {
+		return shape;
+	}
+
+	shape.instantiate();
+	Dictionary data;
+	data["faces"] = faces;
+	data["backface_collision"] = false;
+	data["_voxel_async_cook"] = true;
+	data["_voxel_generation"] = generation;
+	PhysicsServer3D::get_singleton()->shape_set_data(shape->get_rid(), data);
+	return shape;
+}
+
+AsyncConcaveShapeStatus get_async_concave_polygon_shape_status(
+		const Ref<ConcavePolygonShape3D> &shape,
+		uint64_t generation
+) {
+	if (shape.is_null()) {
+		return ASYNC_CONCAVE_READY;
+	}
+
+	const Variant value = PhysicsServer3D::get_singleton()->shape_get_data(shape->get_rid());
+	if (value.get_type() != Variant::DICTIONARY) {
+		return ASYNC_CONCAVE_READY;
+	}
+	const Dictionary data = value;
+	if (!data.has("_voxel_async_status")) {
+		// Non-Jolt backends cook through their existing synchronous path.
+		return ASYNC_CONCAVE_READY;
+	}
+	if (uint64_t(data.get("_voxel_generation", 0)) != generation) {
+		return ASYNC_CONCAVE_FAILED;
+	}
+
+	const int status = int(data.get("_voxel_async_status", 0));
+	if (status > 0) {
+		return ASYNC_CONCAVE_READY;
+	}
+	if (status < 0) {
+		return ASYNC_CONCAVE_FAILED;
+	}
+	return ASYNC_CONCAVE_PENDING;
+}
+
 } // namespace zylann::godot
