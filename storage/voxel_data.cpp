@@ -703,20 +703,47 @@ void VoxelData::clear_cached_blocks_in_voxel_area(Box3i p_voxel_box) {
 	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
 		Lod &lod = _lods[lod_index];
 
-		// Locking area for write because technically we may modify blocks
 		const Box3i blocks_box = p_voxel_box.downscaled(lod.map.get_block_size() << lod_index);
-		SpatialLock3D::Write swlock(lod.spatial_lock, blocks_box);
 
-		// Locking map for read because we won't add or remove blocks
-		RWLockRead rlock(lod.map_lock);
+		StdVector<Vector3i> blocks_to_clear;
+		{
+			// Locking map for read because we won't add or remove blocks
+			RWLockRead rlock(lod.map_lock);
 
-		blocks_box.for_each_cell_zxy([&lod](const Vector3i bpos) {
-			VoxelDataBlock *block = lod.map.get_block(bpos);
-			if (block == nullptr || block->is_edited() || block->is_modified()) {
-				return;
+			int64_t box_volume = (int64_t)blocks_box.size.x * blocks_box.size.y * blocks_box.size.z;
+			if (box_volume > lod.map.get_block_count()) {
+				lod.map.for_each_block([&blocks_box, &blocks_to_clear](Vector3i bpos, const VoxelDataBlock &block) {
+					if (blocks_box.contains(bpos)) {
+						if (!block.is_edited() && !block.is_modified()) {
+							blocks_to_clear.push_back(bpos);
+						}
+					}
+				});
+			} else {
+				blocks_box.for_each_cell_zxy([&lod, &blocks_to_clear](const Vector3i bpos) {
+					VoxelDataBlock *block = lod.map.get_block(bpos);
+					if (block != nullptr && !block->is_edited() && !block->is_modified()) {
+						blocks_to_clear.push_back(bpos);
+					}
+				});
 			}
-			block->clear_voxels();
-		});
+		}
+
+		for (size_t i = 0; i < blocks_to_clear.size(); ++i) {
+			Vector3i bpos = blocks_to_clear[i];
+			// Lock this block area for write. This still waits if the block is currently busy,
+			// but only blocks the main thread for the specific blocks we're clearing,
+			// instead of locking the entire bounding box at once.
+			SpatialLock3D::Write swlock(lod.spatial_lock, Box3i(bpos, Vector3i(1, 1, 1)));
+
+			// The block might have been removed or edited while we didn't hold the map lock,
+			// so we must re-query it and re-check its status.
+			RWLockRead rlock(lod.map_lock);
+			VoxelDataBlock *block = lod.map.get_block(bpos);
+			if (block != nullptr && !block->is_edited() && !block->is_modified()) {
+				block->clear_voxels();
+			}
+		}
 	}
 }
 
@@ -955,7 +982,20 @@ void VoxelData::update_lods(Span<const Vector3i> modified_lod0_blocks, StdVector
 					}
 
 				} else {
-					ZN_PRINT_ERROR(
+					// Streaming: the parent chunk being absent means no viewer holds this area at
+					// a coarse LOD — nothing is drawn there right now, so there is no mip to keep
+					// honest. The full-load branch above generates the parent on the spot; doing
+					// that here would also OVERWRITE whatever mips the stream may have saved for
+					// that chunk in past sessions (the stream cannot be consulted synchronously),
+					// erasing older edits from the coarse picture. So: skip. The cost is that this
+					// edit's mip is missing if the chunk streams in later; it heals on the next
+					// edit that cascades while the parent is loaded.
+					//
+					// Verbose, not error: a digger working away from every viewer (bm-underworld:
+					// crew after the machine leaves, served by data-only viewers with short view
+					// distance) lands here every edit tick, and as an error this printed thousands
+					// of lines per minute for a situation that is expected under streaming.
+					ZN_PRINT_VERBOSE(
 							format("Destination block {} not found when cascading edits on LOD {}",
 								   dst_bpos,
 								   static_cast<int>(dst_lod_index))
