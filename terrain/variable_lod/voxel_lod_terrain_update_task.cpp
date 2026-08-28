@@ -338,7 +338,11 @@ void send_mesh_requests(
 			task->meshing_dependency = meshing_dependency;
 			task->data = data_ptr;
 			task->require_visual = mesh_to_update.require_visual;
-			task->collision_hint = settings.collision_enabled;
+			task->collision_hint =
+					settings.collision_enabled &&
+					lod_index < settings.collision_lod_count &&
+					mesh_block.collision_viewers.get() > 0;
+			task->collision_revision = mesh_block.collision_revision.load();
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 			task->detail_texture_settings = settings.detail_texture_settings;
 			task->detail_texture_generator_override = settings.detail_texture_generator_override;
@@ -591,7 +595,7 @@ void process_changed_generated_areas(
 
 			RWLockRead rlock(lod.mesh_map_state.map_lock);
 
-			bbox.for_each_cell_zxy([&lod, &batch_lod, &batch](const Vector3i bpos) {
+			bbox.for_each_cell_zxy([&lod, &batch_lod, &batch, lod_index](const Vector3i bpos) {
 				auto block_it = lod.mesh_map_state.map.find(bpos);
 				if (block_it != lod.mesh_map_state.map.end()) {
 					const size_t before = lod.mesh_blocks_pending_update.size();
@@ -599,7 +603,8 @@ void process_changed_generated_areas(
 							block_it->second,
 							bpos,
 							lod.mesh_blocks_pending_update,
-							block_it->second.mesh_viewers.get() > 0
+							block_it->second.mesh_viewers.get() > 0,
+							lod_index == 0
 					);
 					if (lod.mesh_blocks_pending_update.size() != before && batch_lod.insert(bpos).second) {
 						++batch.remaining;
@@ -640,8 +645,7 @@ void VoxelLodTerrainUpdateTask::send_block_save_requests(
 void VoxelLodTerrainUpdateTask::flush_pending_lod_edits(
 		VoxelLodTerrainUpdateData::State &state,
 		VoxelData &data,
-		const int mesh_block_size
-) {
+		const int mesh_block_size) {
 	ZN_DSTACK();
 	ZN_PROFILE_SCOPE();
 
@@ -682,7 +686,7 @@ void VoxelLodTerrainUpdateTask::flush_pending_lod_edits(
 			const Box3i padded_voxel_box = voxel_box.padded(1);
 			const Box3i mesh_block_box = padded_voxel_box.downscaled(mesh_block_size_at_lod);
 
-			mesh_block_box.for_each_cell([&lod](Vector3i mesh_block_pos) {
+			mesh_block_box.for_each_cell([&lod, lod_index](Vector3i mesh_block_pos) {
 				auto mesh_block_it = lod.mesh_map_state.map.find(mesh_block_pos);
 				if (mesh_block_it != lod.mesh_map_state.map.end()) {
 					// If a mesh block state exists here, it will need an update.
@@ -691,7 +695,8 @@ void VoxelLodTerrainUpdateTask::flush_pending_lod_edits(
 							mesh_block_it->second, //
 							mesh_block_pos, //
 							lod.mesh_blocks_pending_update, //
-							mesh_block_it->second.mesh_viewers.get() > 0 //
+							mesh_block_it->second.mesh_viewers.get() > 0, //
+							lod_index == 0 //
 					);
 				}
 			});

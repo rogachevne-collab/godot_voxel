@@ -50,6 +50,7 @@ public:
 		VoxelMesher::Output surfaces;
 		// Deindexed collision triangles, prepared by the mesh worker.
 		PackedVector3Array collision_faces;
+		uint64_t collision_revision = 0;
 		// Only used if `has_mesh_resource` is true (usually when meshes are allowed to be build in threads). Otherwise,
 		// mesh data will be in `surfaces` and has to be built on the main thread.
 		Ref<Mesh> mesh;

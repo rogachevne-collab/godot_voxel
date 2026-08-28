@@ -639,6 +639,7 @@ void MeshBlockTask::apply_result() {
 			o.lod = lod_index;
 			o.surfaces = std::move(_surfaces_output);
 			o.collision_faces = std::move(_collision_faces);
+			o.collision_revision = collision_revision;
 			o.mesh = _mesh;
 			o.shadow_occluder_mesh = _shadow_occluder_mesh;
 			o.mesh_material_indices = std::move(_mesh_material_indices);

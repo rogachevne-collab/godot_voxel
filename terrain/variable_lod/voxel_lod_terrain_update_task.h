@@ -69,8 +69,12 @@ public:
 			VoxelLodTerrainUpdateData::MeshBlockState &block,
 			const Vector3i bpos,
 			StdVector<VoxelLodTerrainUpdateData::MeshToUpdate> &blocks_pending_update,
-			const bool require_visual
+			const bool require_visual,
+			const bool collision_changed = false
 	) {
+		if (collision_changed) {
+			++block.collision_revision;
+		}
 		if (block.state != VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT) {
 			if (block.visual_active || block.collision_active) {
 				// Schedule an update

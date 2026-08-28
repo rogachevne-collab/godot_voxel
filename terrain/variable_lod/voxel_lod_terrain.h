@@ -202,6 +202,10 @@ public:
 		uint64_t collision_cook_pending = 0;
 		uint64_t collision_cook_stale = 0;
 		uint64_t collision_cook_completed = 0;
+		uint64_t collision_result_lod0 = 0;
+		uint64_t collision_skip_disabled = 0;
+		uint64_t collision_skip_no_viewer = 0;
+		uint64_t collision_skip_stale = 0;
 	};
 
 	const Stats &get_stats() const;

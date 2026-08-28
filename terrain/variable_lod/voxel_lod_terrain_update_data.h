@@ -78,6 +78,7 @@ struct VoxelLodTerrainUpdateData {
 		// If streaming is disabled, this option has no effect.
 		bool cache_generated_blocks = false;
 		bool collision_enabled = true;
+		unsigned int collision_lod_count = 0;
 		bool detail_textures_use_gpu = false;
 		bool generator_use_gpu = false;
 		uint8_t detail_texture_generator_override_begin_lod_index = 0;
@@ -106,6 +107,8 @@ struct VoxelLodTerrainUpdateData {
 	struct MeshBlockState {
 		std::atomic<MeshState> state;
 		std::atomic<DetailTextureState> detail_texture_state;
+		// Changes only when the block's collision geometry must be rebuilt.
+		std::atomic<uint64_t> collision_revision;
 
 		// Refcount here to support multiple viewers, we can't do it on the main thread's mesh map since the
 		// streaming logic is in the update task.
@@ -141,6 +144,7 @@ struct VoxelLodTerrainUpdateData {
 		MeshBlockState() :
 				state(MESH_NEVER_UPDATED),
 				detail_texture_state(DETAIL_TEXTURE_IDLE),
+				collision_revision(0),
 				update_list_index(-1),
 				transition_mask(0),
 				visual_active(false),

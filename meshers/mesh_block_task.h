@@ -62,6 +62,7 @@ public:
 	bool require_visual = true;
 	// If true, a collision mesh is required if possible
 	bool collision_hint = false;
+	uint64_t collision_revision = 0;
 	// If true, the mesh will be used in a context with LOD, which might require a few extra things in the way it is
 	// built
 	bool lod_hint = false;

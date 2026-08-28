@@ -1002,6 +1002,7 @@ bool VoxelLodTerrain::get_generate_collisions() const {
 void VoxelLodTerrain::set_collision_lod_count(int lod_count) {
 	ERR_FAIL_COND(lod_count < 0);
 	_collision_lod_count = static_cast<unsigned int>(math::min(lod_count, get_lod_count()));
+	_update_data->settings.collision_lod_count = _collision_lod_count;
 }
 
 int VoxelLodTerrain::get_collision_lod_count() const {
@@ -2265,6 +2266,7 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	bool visual_expected = false;
 	bool collision_expected = false;
 	bool mesh_update_current = false;
+	bool collision_update_current = false;
 	{
 		VoxelLodTerrainUpdateData::Lod &lod = update_data.state.lods[ob.lod];
 		RWLockRead rlock(lod.mesh_map_state.map_lock);
@@ -2287,11 +2289,13 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		transition_mask = mesh_block_state.transition_mask;
 
 		// The update task could be running at the same time, so we need to do this atomically.
-		// The state can become "up to date" only if no other unsent update was pending.
+		// Visual freshness and collision freshness are independent: viewer motion may supersede the visual result,
+		// while the collision geometry remains valid until a real remesh changes its revision.
 		VoxelLodTerrainUpdateData::MeshState expected = VoxelLodTerrainUpdateData::MESH_UPDATE_SENT;
-		// TODO We need to separate visuals from collider
 		mesh_update_current =
 				mesh_block_state.state.compare_exchange_strong(expected, VoxelLodTerrainUpdateData::MESH_UP_TO_DATE);
+		collision_update_current =
+				ob.collision_revision == mesh_block_state.collision_revision.load();
 		visual_active = mesh_block_state.visual_active;
 		collision_active = mesh_block_state.collision_active;
 
@@ -2528,8 +2532,18 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	if (has_collision && _collision_lod_count != 0) {
 		has_collision = ob.lod < _collision_lod_count;
 	}
+	if (ob.lod == 0) {
+		++_stats.collision_result_lod0;
+		if (!has_collision) {
+			++_stats.collision_skip_disabled;
+		} else if (!collision_expected) {
+			++_stats.collision_skip_no_viewer;
+		} else if (!collision_update_current) {
+			++_stats.collision_skip_stale;
+		}
+	}
 
-	if (has_collision && collision_expected && mesh_update_current) {
+	if (has_collision && collision_expected && collision_update_current) {
 		const uint64_t now = get_ticks_msec();
 		block->collision_requested = true;
 		block->set_collision_enabled(collision_active);
@@ -3079,6 +3093,10 @@ Dictionary VoxelLodTerrain::_b_get_statistics() const {
 	d["collision_cook_pending"] = _stats.collision_cook_pending;
 	d["collision_cook_stale"] = _stats.collision_cook_stale;
 	d["collision_cook_completed"] = _stats.collision_cook_completed;
+	d["collision_result_lod0"] = _stats.collision_result_lod0;
+	d["collision_skip_disabled"] = _stats.collision_skip_disabled;
+	d["collision_skip_no_viewer"] = _stats.collision_skip_no_viewer;
+	d["collision_skip_stale"] = _stats.collision_skip_stale;
 
 	return d;
 }
@@ -3119,7 +3137,11 @@ void VoxelLodTerrain::remesh_all_blocks() {
 		VoxelLodTerrainUpdateData::Lod &lod = _update_data->state.lods[lod_index];
 		for (auto it = lod.mesh_map_state.map.begin(); it != lod.mesh_map_state.map.end(); ++it) {
 			VoxelLodTerrainUpdateTask::schedule_mesh_update(
-					it->second, it->first, lod.mesh_blocks_pending_update, it->second.mesh_viewers.get() > 0
+					it->second,
+					it->first,
+					lod.mesh_blocks_pending_update,
+					it->second.mesh_viewers.get() > 0,
+					lod_index == 0
 			);
 		}
 	}
