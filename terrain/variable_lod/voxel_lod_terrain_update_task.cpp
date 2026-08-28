@@ -342,7 +342,9 @@ void send_mesh_requests(
 					settings.collision_enabled &&
 					lod_index < settings.collision_lod_count &&
 					mesh_block.collision_viewers.get() > 0;
-			task->collision_revision = mesh_block.collision_revision.load();
+			const uint64_t collision_revision = mesh_block.collision_revision.load();
+			task->collision_revision = collision_revision;
+			mesh_block.requested_collision_revision.store(collision_revision);
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 			task->detail_texture_settings = settings.detail_texture_settings;
 			task->detail_texture_generator_override = settings.detail_texture_generator_override;

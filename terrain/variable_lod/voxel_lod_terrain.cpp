@@ -659,6 +659,13 @@ void VoxelLodTerrain::post_edit_area(Box3i p_box, bool update_mesh) {
 void VoxelLodTerrain::post_edit_modifiers(Box3i p_voxel_box) {
 	// clear_cached_blocks_in_voxel_area(*_data, p_voxel_box);
 	_data->clear_cached_blocks_in_voxel_area(p_voxel_box);
+	// The collider cache has to be told as well, and this is the second of the two doors that change the
+	// ground — `post_edit_area` is the other one and already does it. A host game whose edits live in the
+	// generator rather than in voxel data (bm-underworld writes its mirror and asks for a remesh) comes
+	// through HERE and only here, so without this line the cache answers every rebuilt block with the shape
+	// it had before the change: the picture updates, the collider does not, and neither does anything baked
+	// from it. The symptom is a navigation mesh that never notices the tunnel that was just dug.
+	invalidate_collision_cache(p_voxel_box);
 	// Not sure if it is worth re-caching these blocks. We may see about that in the future if performance is an issue.
 
 	MutexLock lock(_update_data->state.changed_generated_areas_mutex);
@@ -2188,11 +2195,16 @@ void VoxelLodTerrain::flush_remesh_batch(const uint32_t batch_id) {
 			continue;
 		}
 		{
+			// A held output is superseded only when a NEWER REQUEST went out for the block, which is what
+			// `requested_collision_revision` records. `MESH_UP_TO_DATE` does not say that: an OLDER result
+			// taking the immediate path sets it too, and the fresher held output was then discarded as if it
+			// were the stale one. That is not a rare race — on world opening it cost every single LOD0
+			// collider, and with them the navigation mesh, on a terrain that looked perfectly fine.
 			VoxelLodTerrainUpdateData::Lod &lod = _update_data->state.lods[ob.lod];
 			RWLockRead rlock(lod.mesh_map_state.map_lock);
 			auto it = lod.mesh_map_state.map.find(ob.position);
 			if (it != lod.mesh_map_state.map.end() &&
-				it->second.state == VoxelLodTerrainUpdateData::MESH_UP_TO_DATE) {
+				ob.collision_revision != it->second.requested_collision_revision.load()) {
 				continue;
 			}
 		}
@@ -2295,7 +2307,7 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		mesh_update_current =
 				mesh_block_state.state.compare_exchange_strong(expected, VoxelLodTerrainUpdateData::MESH_UP_TO_DATE);
 		collision_update_current =
-				ob.collision_revision == mesh_block_state.collision_revision.load();
+				ob.collision_revision == mesh_block_state.requested_collision_revision.load();
 		visual_active = mesh_block_state.visual_active;
 		collision_active = mesh_block_state.collision_active;
 

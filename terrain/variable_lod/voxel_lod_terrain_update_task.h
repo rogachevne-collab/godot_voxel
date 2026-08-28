@@ -72,21 +72,45 @@ public:
 			const bool require_visual,
 			const bool collision_changed = false
 	) {
-		if (collision_changed) {
-			++block.collision_revision;
-		}
-		if (block.state != VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT) {
-			if (block.visual_active || block.collision_active) {
-				// Schedule an update
-				block.state = VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT;
-				block.update_list_index = blocks_pending_update.size();
-				blocks_pending_update.push_back(
-						VoxelLodTerrainUpdateData::MeshToUpdate{ bpos, TaskCancellationToken(), require_visual }
-				);
-			} else {
-				// Just mark it as needing update, so the visibility system will schedule its update when needed.
-				block.state = VoxelLodTerrainUpdateData::MESH_NEED_UPDATE;
+		if (block.state == VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT) {
+			// Already queued and not sent yet. The request reads the block's current state when it goes out,
+			// so it will carry this change too.
+			if (collision_changed) {
+				++block.collision_revision;
 			}
+			return;
+		}
+		// Parking hands the block to the visibility system, and that system only ever reaches blocks whose
+		// parent LOD is active. A parent becomes active when a mesh result arrives for it — so a block that
+		// has never produced one has no way back: it needs a mesh to be reached, and it needs to be reached
+		// to be given a mesh. Left parked, it sits in `MESH_NEED_UPDATE` for the rest of the session with no
+		// mesh, no error and no second opinion. Host games that call `post_edit_modifiers` while streaming is
+		// still filling the area (bm-underworld does it per pasted chunk, all through world opening) walk into
+		// this on every boot: the whole terrain stays invisible.
+		const bool never_meshed = !block.visual_loaded && !block.collision_loaded;
+		if (block.visual_active || block.collision_active || never_meshed) {
+			// Schedule an update
+			if (collision_changed) {
+				++block.collision_revision;
+			}
+			block.state = VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT;
+			block.update_list_index = blocks_pending_update.size();
+			blocks_pending_update.push_back(
+					VoxelLodTerrainUpdateData::MeshToUpdate{ bpos, TaskCancellationToken(), require_visual }
+			);
+		} else {
+			// Just mark it as needing update, so the visibility system will schedule its update when needed.
+			// `set_active` in the clipbox streamer is the other half of that promise.
+			//
+			// No collision revision bump here, deliberately. The revision exists to reject a collider built
+			// before a change, and it can only do that job while every bump is paired with a request that
+			// carries the new number. Parking sends no request, so a bump here just runs the counter ahead of
+			// the results and starves the block: a host game remeshing generated areas while streaming fills
+			// them (bm-underworld does it per pasted chunk) has every arriving collider rejected as stale and
+			// gets no terrain collision at all — and so no navigation mesh — until an ordinary edit happens to
+			// land in a quiet moment. The block is rebuilt when `set_active` un-parks it, and that request
+			// reads the revision as it stands.
+			block.state = VoxelLodTerrainUpdateData::MESH_NEED_UPDATE;
 		}
 	}
 

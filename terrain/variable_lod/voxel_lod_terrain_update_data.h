@@ -109,6 +109,11 @@ struct VoxelLodTerrainUpdateData {
 		std::atomic<DetailTextureState> detail_texture_state;
 		// Changes only when the block's collision geometry must be rebuilt.
 		std::atomic<uint64_t> collision_revision;
+		// The revision the last mesh request actually went out with. Results are judged against THIS and not
+		// against `collision_revision`, so a result is only ever thrown away when a newer request exists to
+		// replace it. Judging against the counter itself starves the block whenever the counter moves without
+		// a request behind it: nothing arrives, nothing is scheduled, and the block keeps no collider at all.
+		std::atomic<uint64_t> requested_collision_revision;
 
 		// Refcount here to support multiple viewers, we can't do it on the main thread's mesh map since the
 		// streaming logic is in the update task.
@@ -145,6 +150,7 @@ struct VoxelLodTerrainUpdateData {
 				state(MESH_NEVER_UPDATED),
 				detail_texture_state(DETAIL_TEXTURE_IDLE),
 				collision_revision(0),
+				requested_collision_revision(0),
 				update_list_index(-1),
 				transition_mask(0),
 				visual_active(false),

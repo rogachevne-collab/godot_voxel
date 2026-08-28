@@ -813,10 +813,18 @@ void view_mesh_box(
 			// need to keep a cache mesh data ourselves. The issue is that Godot is also caching mesh data in ArrayMesh
 			// (but for different reasons so it's not reliable), so it would come at a noticeable memory cost.
 
+			// What gets requested is what the BLOCK needs, not what this particular viewer wants. A
+			// collision-only viewer reaching a block that visual viewers already hold would otherwise
+			// order a mesh without visuals, and that request wins: the result marks the block up to
+			// date while leaving it with no rendering mesh, and nothing schedules it again. A game that
+			// switches collisions on partway through startup (bm-underworld defers them until the
+			// opening is visible) loses LOD0 to this and is left looking at the coarsest level only.
+			const bool needs_visuals = mesh_block->mesh_viewers.get() > 0;
+
 			if (is_full_load_mode) {
 				// Everything is loaded up-front, so we have to directly trigger meshing instead of
 				// reacting to data chunks being loaded
-				schedule_mesh_load(lod.mesh_blocks_pending_update, bpos, *mesh_block, require_visuals);
+				schedule_mesh_load(lod.mesh_blocks_pending_update, bpos, *mesh_block, needs_visuals);
 
 			} else {
 				// (Re-)Trigger meshing if data is already available.
@@ -835,7 +843,7 @@ void view_mesh_box(
 				const bool data_available = voxel_data.has_all_blocks_in_area_unbound(data_box, lod_index);
 
 				if (data_available) {
-					schedule_mesh_load(lod.mesh_blocks_pending_update, bpos, *mesh_block, require_visuals);
+					schedule_mesh_load(lod.mesh_blocks_pending_update, bpos, *mesh_block, needs_visuals);
 				}
 				// Else, we'll react to when data is loaded
 			}
@@ -1418,6 +1426,22 @@ void set_active(
 		default:
 			ZN_CRASH();
 			break;
+	}
+
+	// The other half of what `schedule_mesh_update` promises when it parks a block: the voxels under an
+	// inactive block can change while nobody is looking, and the block is then left in `MESH_NEED_UPDATE`
+	// for whoever shows it next. Showing it IS that moment. Without this, the only path that ever un-parked
+	// a block was `unview_mesh_box` merging children into a parent, so a block parked before it was first
+	// shown kept the mesh it happened to have and stayed out of date forever — which also keeps it out of
+	// `is_area_meshed` (that asks for `MESH_UP_TO_DATE`) and leaves any collider revision waiting on a
+	// request that is never sent.
+	if (mesh_block.state == VoxelLodTerrainUpdateData::MESH_NEED_UPDATE) {
+		mesh_block.state = VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT;
+		mesh_block.update_list_index = lod.mesh_blocks_pending_update.size();
+		lod.mesh_blocks_pending_update.push_back(
+				VoxelLodTerrainUpdateData::MeshToUpdate{
+						bpos, TaskCancellationToken(), mesh_block.mesh_viewers.get() > 0 }
+		);
 	}
 }
 
